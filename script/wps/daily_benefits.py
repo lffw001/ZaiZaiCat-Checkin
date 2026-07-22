@@ -47,19 +47,32 @@ from notification import send_notification, NotificationSound
 class DailyBenefitsAPI:
     """WPS 天天领福利活动接口封装"""
 
-    MARKET_ACTIVITY_URL = "https://tiance.wps.cn/dce/exec/api/market/activity?rmsp=pv_vip_site"
+    MARKET_ACTIVITY_URL = "https://tiance.wps.cn/dce/exec/api/market/activity"
     PAGE_INFO_URL = "https://personal-act.wps.cn/activity-rubik/activity/page_info"
     COMPONENT_ACTION_URL = "https://personal-act.wps.cn/activity-rubik/activity/component_action"
 
-    MARKET_ACTIVITY_PAYLOAD = {
-        "channel_code": "HYGW5004,GWHD5002",
-        "version": "",
-        "platform": 8,
-        "device": 1,
-        "hdid": "",
-        "filter_info": {}
-    }
+    # 依次查询多个营销渠道并合并入口候选，靠前的渠道优先级更高。
+    # AUTOPCHYZXYYHD3737: PC 会员中心运营活动聚合位，无需登录即可稳定返回福利入口。
+    # HYGW5004,GWHD5002: 旧渠道，作为兜底（部分账号登录态下仍会返回入口）。
+    MARKET_ACTIVITY_CHANNELS = [
+        {
+            "channel_code": "AUTOPCHYZXYYHD3737",
+            "platform": 8,
+            "version": "0.0.0.0"
+        },
+        {
+            "channel_code": "HYGW5004,GWHD5002",
+            "version": "",
+            "platform": 8,
+            "device": 1,
+            "hdid": "",
+            "filter_info": {}
+        }
+    ]
 
+    # 入口判定依据活动链接 query 中的 position 参数，福利中心固定为 pc_nvc_activity_fuli。
+    # 选中优先级：position 精确命中 > position 含 fuli > 标题命中。
+    TARGET_POSITIONS = ("pc_nvc_activity_fuli",)
     TARGET_TITLES = {"福利中心", "天天领福利"}
 
     def __init__(self, cookies: str, user_agent: Optional[str] = None):
@@ -200,9 +213,9 @@ class DailyBenefitsAPI:
                 "error": f"响应解析失败: {exc}"
             }
 
-    def get_market_activity(self) -> Dict[str, Any]:
-        """获取市场活动数据"""
-        self.logger.info("获取活动入口数据", extra={"step": "入口发现"})
+    def get_market_activity(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """获取单个渠道的市场活动数据"""
+        request_payload = payload if payload is not None else self.MARKET_ACTIVITY_CHANNELS[0]
         result = self._request(
             "POST",
             self.MARKET_ACTIVITY_URL,
@@ -211,63 +224,117 @@ class DailyBenefitsAPI:
                 "sec-fetch-mode": "cors",
                 "sec-fetch-dest": "empty"
             },
-            json_data=self.MARKET_ACTIVITY_PAYLOAD
+            json_data=request_payload
         )
 
         if not result["success"]:
             return result
 
-        payload = result["data"]
-        if payload.get("result") != "ok":
-            return self._build_failure_result(payload)
+        payload_data = result["data"]
+        if payload_data.get("result") != "ok":
+            return self._build_failure_result(payload_data)
 
         return {
             "success": True,
-            "data": payload
+            "data": payload_data
         }
 
     def get_benefit_portal(self) -> Dict[str, Any]:
-        """从市场活动数据中提取福利中心入口"""
-        market_result = self.get_market_activity()
-        if not market_result["success"]:
-            return market_result
+        """跨多个营销渠道发现并选中「天天领福利」活动入口"""
+        raw_candidates: List[Dict[str, str]] = []
+        channel_errors: List[str] = []
+        auth_expired = False
 
-        candidates: List[Dict[str, str]] = []
-        self._collect_portal_candidates(market_result["data"], candidates)
+        for channel_payload in self.MARKET_ACTIVITY_CHANNELS:
+            channel_code = channel_payload.get("channel_code", "")
+            market_result = self.get_market_activity(channel_payload)
+            if not market_result["success"]:
+                channel_errors.append(f"{channel_code}: {market_result.get('error', '未知错误')}")
+                if market_result.get("error_type") == "token_expired":
+                    auth_expired = True
+                continue
+            self._collect_portal_candidates(market_result["data"], raw_candidates)
 
-        if not candidates:
+        parsed_candidates = self._parse_portal_candidates(raw_candidates)
+        self.logger.info(
+            "入口发现：收集到 %s 个链接，去重后 %s 个入口",
+            len(raw_candidates),
+            len(parsed_candidates),
+            extra={"step": "入口发现"}
+        )
+
+        if not parsed_candidates:
+            failure = {"success": False, "error": "未找到福利中心活动入口"}
+            if auth_expired:
+                failure["error_type"] = "token_expired"
+            elif channel_errors:
+                failure["error"] = (
+                    f"未找到福利中心活动入口（渠道请求失败: {'; '.join(channel_errors)}）"
+                )
+            return failure
+
+        selected = self._select_benefit_portal(parsed_candidates)
+        if selected is None:
+            found_positions = sorted({
+                candidate.get("position", "")
+                for candidate in parsed_candidates
+                if candidate.get("position")
+            })
             return {
                 "success": False,
-                "error": "未找到福利中心活动入口"
+                "error": (
+                    "未匹配到福利中心入口（期望 position=pc_nvc_activity_fuli）"
+                    f"，实际发现: {', '.join(found_positions) or '无 position'}"
+                )
             }
+        return selected
 
-        selected = None
-        for candidate in candidates:
-            if candidate["title"] in self.TARGET_TITLES:
-                selected = candidate
-                break
+    def _parse_portal_candidates(self, raw_candidates: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """解析候选链接并按 activity/page 去重，附带 position/title。"""
+        parsed: List[Dict[str, Any]] = []
+        seen: set = set()
+        for candidate in raw_candidates:
+            portal_info = self._parse_portal_link(candidate["link"])
+            if not portal_info["success"]:
+                continue
 
-        if selected is None:
-            selected = candidates[0]
+            dedup_key = (portal_info["activity_number"], portal_info["page_number"])
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
 
-        portal_info = self._parse_portal_link(selected["link"])
-        if not portal_info["success"]:
-            return portal_info
+            portal_info["title"] = candidate.get("title", "")
+            portal_info["pic"] = candidate.get("pic", "")
+            portal_info["position"] = portal_info.get("filter_params", {}).get("position", "")
+            parsed.append(portal_info)
+        return parsed
 
-        portal_info["title"] = selected["title"]
-        portal_info["pic"] = selected.get("pic", "")
-        return portal_info
+    def _select_benefit_portal(self, parsed_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """按 position 精确命中 > position 含 fuli > 标题命中 的顺序选中福利入口。"""
+        for candidate in parsed_candidates:
+            if candidate.get("position") in self.TARGET_POSITIONS:
+                return candidate
+
+        for candidate in parsed_candidates:
+            if "fuli" in (candidate.get("position") or ""):
+                return candidate
+
+        for candidate in parsed_candidates:
+            if candidate.get("title") in self.TARGET_TITLES:
+                return candidate
+
+        return None
 
     def _collect_portal_candidates(self, node: Any, candidates: List[Dict[str, str]]) -> None:
-        """递归收集包含 portal 链接的活动入口"""
+        """递归收集包含 portal 链接的活动入口（不再要求节点带 title）"""
         if isinstance(node, dict):
             link = node.get("link")
-            title = node.get("title")
-            if isinstance(link, str) and isinstance(title, str) and "/rubik2/portal/" in link:
+            if isinstance(link, str) and "/rubik2/portal/" in link:
+                title = node.get("title")
                 candidates.append({
-                    "title": title,
+                    "title": title if isinstance(title, str) else "",
                     "link": link,
-                    "pic": node.get("pic", "")
+                    "pic": node.get("pic") or node.get("img") or ""
                 })
 
             for value in node.values():
@@ -876,6 +943,12 @@ class DailyBenefitsTasks:
         return any(keyword in str(message) for keyword in keywords)
 
     @staticmethod
+    def _is_broken_series_error(message: str) -> bool:
+        """判断打卡失败是否因旧 series 断签/过期（需要重新开启签到）。"""
+        text = str(message).lower()
+        return "not in series" in text or "series records" in text
+
+    @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
         """将接口返回的数字字段安全转为 int。"""
         try:
@@ -1230,6 +1303,27 @@ class DailyBenefitsTasks:
             sign_series_id=fragment_result.get("sign_series_id", ""),
             is_new_sign_series=fragment_result.get("is_new_sign_series", True)
         )
+
+        # 旧 series 断签/过期（服务端返回 "not in series records"）时，自动以
+        # “重新开启签到”的参数重试一次：sign_date 留空 + is_new_sign_series=true，
+        # 服务端会开启一条新 series 并把今天签为第 1 天（等价于页面手动点“重新开始”）。
+        if (
+            not sign_in_result["success"]
+            and self._is_broken_series_error(sign_in_result.get("error", ""))
+        ):
+            checkin_logger.info(
+                "检测到旧 series 已过期（%s），自动重新开启签到",
+                sign_in_result.get("error", "")
+            )
+            result["free_member_checkin"]["restarted_series"] = True
+            sign_in_result = api.sign_in_fragment_collect(
+                portal_info=portal_result,
+                component_number=fragment_result["component_number"],
+                component_node_id=fragment_result["component_node_id"],
+                sign_date="",
+                sign_series_id=fragment_result.get("sign_series_id", ""),
+                is_new_sign_series=True
+            )
 
         if sign_in_result["success"]:
             message = "打卡免费领会员签到成功，正在刷新签到状态"
@@ -1649,9 +1743,16 @@ class DailyBenefitsTasks:
 
         result["portal_info"] = {
             "title": portal_result.get("title", ""),
+            "position": portal_result.get("position", ""),
             "activity_number": portal_result["activity_number"],
             "page_number": portal_result["page_number"]
         }
+        log_task_result(
+            account_logger,
+            "📍 入口发现",
+            f"✅ {portal_result.get('position') or portal_result.get('title') or '未知入口'} "
+            f"({portal_result['activity_number']})"
+        )
         page_info_result = api.get_page_info(portal_result)
         if not page_info_result["success"]:
             result["message"] = page_info_result["error"]
